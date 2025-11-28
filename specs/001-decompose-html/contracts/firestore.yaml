@@ -1,0 +1,48 @@
+# Firestore Data Schema (Draft)
+# Feature: 001-decompose-html
+# Language: YAML
+
+collections:
+  users:
+    description: "存储用户基本信息"
+    documentId: "{uid}"
+    fields:
+      displayName:
+        type: string
+        required: true
+      email:
+        type: string
+        required: true
+      photoURL:
+        type: string
+        required: false
+      createdAt:
+        type: timestamp
+        required: true
+
+  events:
+    description: "存储行程事件"
+    documentId: "{auto-generated}"
+    fields:
+      title:
+        type: string
+        required: true
+      startTime:
+        type: timestamp
+        required: true
+        description: "ISO 8601 格式的时间戳"
+      endTime:
+        type: timestamp
+        required: true
+      location:
+        type: string
+        required: false
+      creatorId:
+        type: string
+        required: true
+        reference: "users/{uid}"
+      participants:
+        type: array
+        items:
+          type: string
+          reference: "users/{uid}"

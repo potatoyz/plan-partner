@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>多人协作行程规划</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0?dev",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client?dev",
+        "lucide-react": "https://esm.sh/lucide-react@0.460.0?dev&deps=react@18.2.0",
+        "firebase/app": "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js",
+        "firebase/firestore": "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js"
+      }
+    }
+    </script>
+    
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        body { user-select: none; -webkit-user-select: none; }
+        #root:empty::before {
+            content: '正在初始化应用...';
+            display: flex;
+            height: 100vh;
+            justify-content: center;
+            align-items: center;
+            color: #64748b;
+        }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, 0.1); border-radius: 10px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(0, 0, 0, 0.2); }
+        
+        .ghost-event {
+            position: fixed;
+            pointer-events: none;
+            z-index: 9999;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+            opacity: 0.95;
+            transform: scale(1.02);
+            transition: none !important;
+        }
+        .event-dragging-placeholder {
+            opacity: 0.3 !important;
+            filter: grayscale(100%);
+        }
+    </style>
+</head>
+<body class="bg-[#f5f5f7]">
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import { Plus, Trash2, Save, MapPin, Coffee, Bed, Bus, X, Calendar, Share2, Wifi, WifiOff, Download, Upload, RotateCcw, Menu, ExternalLink, LayoutGrid, CirclePlus, MinusCircle, Cloud, History, EyeOff } from 'lucide-react';
+        import { initializeApp } from 'firebase/app';
+        // 这里的 deleteDoc 虽然引用了但这次我们用 setDoc 来做软删除
+        import { getFirestore, doc, onSnapshot, setDoc, collection, getDocs } from 'firebase/firestore';
+
+        // --- 全局变量 ---
+        let db = null;
+
+        const getRoomId = () => {
+            const params = new URLSearchParams(window.location.search);
+            return decodeURIComponent(params.get('room') || '公共大厅');
+        };
+        const ROOM_ID = getRoomId();
+
+        const INITIAL_DATA = [
+            { id: '1', day: 1, name: '示例行程', type: 'sightseeing', start: '09:00', end: '11:00', notes: '试着拖动我！' }
+        ];
+
+        const useTripManager = (dbInstance, connectionStatus) => {
+            const [history, setHistory] = useState([]);
+            const [cloudRooms, setCloudRooms] = useState([]);
+            
+            // 1. 加载本地历史
+            useEffect(() => {
+                try {
+                    const saved = JSON.parse(localStorage.getItem('my_trip_history') || '[]');
+                    const current = { id: ROOM_ID, lastVisited: Date.now() };
+                    const others = saved.filter(t => t.id !== ROOM_ID);
+                    const newHistory = [current, ...others].slice(0, 20);
+                    localStorage.setItem('my_trip_history', JSON.stringify(newHistory));
+                    setHistory(newHistory);
+                } catch (e) { console.error(e); }
+            }, []);
+
+            // 2. 加载云端列表 (新增过滤逻辑)
+            useEffect(() => {
+                if (connectionStatus === 'connected' && dbInstance) {
+                    const fetchRooms = async () => {
+                        try {
+                            const querySnapshot = await getDocs(collection(dbInstance, "travel_plans"));
+                            // 过滤掉标记为 isDeleted 的房间
+                            const rooms = querySnapshot.docs
+                                .filter(doc => !doc.data().isDeleted) 
+                                .map(doc => ({ id: doc.id }));
+                            
+                            setCloudRooms(rooms.sort((a, b) => a.id.localeCompare(b.id)));
+                        } catch (e) { console.error("获取云端房间失败:", e); }
+                    };
+                    fetchRooms();
+                }
+            }, [dbInstance, connectionStatus]);
+
+            const createNewTrip = () => {
+                const name = prompt("请输入新行程的名称：", "我的北京之旅");
+                if (name && name.trim()) {
+                    window.location.href = `?room=${encodeURIComponent(name.trim())}`;
+                }
+            };
+
+            const switchTrip = (id) => window.location.href = `?room=${encodeURIComponent(id)}`;
+
+            // 删除本地历史
+            const deleteHistoryTrip = (e, id) => {
+                e.stopPropagation();
+                if (id === ROOM_ID) return alert("无法删除当前正在使用的行程。");
+                if (confirm(`确定从本地历史中移除 "${id}" 吗？\n(云端数据不会丢失)`)) {
+                    const newHistory = history.filter(t => t.id !== id);
+                    setHistory(newHistory);
+                    localStorage.setItem('my_trip_history', JSON.stringify(newHistory));
+                }
+            };
+
+            // 软删除云端行程 (更新逻辑)
+            const deleteCloudTrip = async (e, id) => {
+                e.stopPropagation();
+                if (id === ROOM_ID) return alert("无法删除当前正在使用的行程，请先切换到其他行程。");
+                
+                if (confirm(`确定要移除云端行程 "${id}" 吗？\n\n注意：\n1. 这是“软删除”，数据仍保留在数据库中。\n2. 它将从所有人的列表中消失。\n3. 如果您以后再次创建同名行程，旧数据会自动恢复显示。`)) {
+                    try {
+                        // 使用 setDoc + merge 进行软删除 (标记 isDeleted=true)
+                        await setDoc(doc(dbInstance, "travel_plans", id), { isDeleted: true }, { merge: true });
+                        
+                        // 立即更新UI
+                        setCloudRooms(prev => prev.filter(r => r.id !== id));
+                        
+                        // 同时清理本地历史，眼不见为净
+                        const newHistory = history.filter(t => t.id !== id);
+                        setHistory(newHistory);
+                        localStorage.setItem('my_trip_history', JSON.stringify(newHistory));
+                        
+                        alert(`行程 "${id}" 已移除。`);
+                    } catch (err) {
+                        console.error("Delete failed", err);
+                        alert("操作失败，可能是权限不足或网络问题。");
+                    }
+                }
+            };
+
+            return { history, cloudRooms, createNewTrip, switchTrip, deleteHistoryTrip, deleteCloudTrip };
+        };
+
+        function TravelPlanner() {
+            // 状态
+            const [configLoaded, setConfigLoaded] = useState(false);
+            const [events, setEvents] = useState([]);
+            const [totalDays, setTotalDays] = useState(5);
+            const [status, setStatus] = useState('loading');
+            
+            // UI 状态
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [isMenuOpen, setIsMenuOpen] = useState(false);
+            const [editingEvent, setEditingEvent] = useState(null);
+            const [formData, setFormData] = useState({ name: '', day: 1, start: '09:00', end: '10:00', type: 'sightseeing', notes: '' });
+
+            const timelineRef = useRef(null);
+            const ghostRef = useRef(null);
+            const dragInfoRef = useRef(null);
+            
+            const fileInputRef = useRef(null);
+            
+            const { history, cloudRooms, createNewTrip, switchTrip, deleteHistoryTrip, deleteCloudTrip } = useTripManager(db, status);
+
+            // 1. 初始化
+            useEffect(() => {
+                const initApp = async () => {
+                    if (window.location.protocol === 'blob:') {
+                        console.warn("预览环境：跳过 .secret.json 加载");
+                        setStatus('offline');
+                        loadFromLocal();
+                        setConfigLoaded(true);
+                        return;
+                    }
+
+                    try {
+                        const res = await fetch('.secret.json');
+                        if (!res.ok) throw new Error("无法读取 .secret.json");
+                        const config = await res.json();
+                        const app = initializeApp(config);
+                        db = getFirestore(app);
+                        setStatus('connecting');
+                        setConfigLoaded(true);
+                    } catch (e) {
+                        console.error("Config load failed:", e);
+                        setStatus('offline');
+                        loadFromLocal();
+                        setConfigLoaded(true);
+                    }
+                };
+                initApp();
+            }, []);
+
+            // 2. 监听数据库
+            useEffect(() => {
+                if (!db) return;
+                const unsub = onSnapshot(doc(db, "travel_plans", ROOM_ID), (docSnap) => {
+                    if (docSnap.exists()) {
+                        const data = docSnap.data();
+                        setEvents(data.events || []);
+                        setTotalDays(data.totalDays || 5);
+                        setStatus('connected');
+                    } else {
+                        // 新建或初始化时，确保 isDeleted 为 false
+                        setDoc(doc(db, "travel_plans", ROOM_ID), { 
+                            events: INITIAL_DATA, 
+                            totalDays: 5,
+                            isDeleted: false 
+                        }, { merge: true });
+                        
+                        setEvents(INITIAL_DATA);
+                        setTotalDays(5);
+                        setStatus('connected');
+                    }
+                }, (err) => {
+                    console.error("Sync error:", err);
+                    setStatus('offline');
+                    loadFromLocal();
+                });
+                return () => unsub();
+            }, [configLoaded]);
+
+            const loadFromLocal = () => {
+                const saved = localStorage.getItem(`plan_${ROOM_ID}`);
+                if (saved) {
+                    const parsed = JSON.parse(saved);
+                    if (Array.isArray(parsed)) {
+                        setEvents(parsed);
+                        setTotalDays(5);
+                    } else {
+                        setEvents(parsed.events || []);
+                        setTotalDays(parsed.totalDays || 5);
+                    }
+                } else {
+                    setEvents(INITIAL_DATA);
+                    setTotalDays(5);
+                }
+            };
+
+            const saveData = async (newEvents, newTotalDays) => {
+                const finalEvents = newEvents !== undefined ? newEvents : events;
+                const finalDays = newTotalDays !== undefined ? newTotalDays : totalDays;
+                setEvents(finalEvents);
+                setTotalDays(finalDays);
+                
+                // 保存时，强制将 isDeleted 设为 false，实现“恢复”功能
+                const dataToSave = { 
+                    events: finalEvents, 
+                    totalDays: finalDays,
+                    isDeleted: false 
+                };
+
+                if (db) {
+                    try {
+                        await setDoc(doc(db, "travel_plans", ROOM_ID), dataToSave, { merge: true });
+                    } catch (e) { alert("云端保存失败，已存入本地"); }
+                }
+                localStorage.setItem(`plan_${ROOM_ID}`, JSON.stringify(dataToSave));
+            };
+
+            // --- 影子拖拽逻辑 ---
+            const handleMouseDown = (e, event) => {
+                const targetEl = e.currentTarget; 
+                const rect = targetEl.getBoundingClientRect();
+                
+                dragInfoRef.current = {
+                    isDragging: false, 
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    offsetX: e.clientX - rect.left,
+                    offsetY: e.clientY - rect.top,
+                    width: rect.width,
+                    height: rect.height,
+                    eventData: event,
+                    originalEl: targetEl,
+                    startMin: timeToMinutes(event.start),
+                    endMin: timeToMinutes(event.end)
+                };
+
+                document.addEventListener('mousemove', handleGlobalMouseMove);
+                document.addEventListener('mouseup', handleGlobalMouseUp);
+            };
+
+            const handleGlobalMouseMove = (e) => {
+                const info = dragInfoRef.current;
+                if (!info) return;
+
+                if (!info.isDragging) {
+                    const dist = Math.sqrt(Math.pow(e.clientX - info.startX, 2) + Math.pow(e.clientY - info.startY, 2));
+                    if (dist < 5) return; 
+
+                    info.isDragging = true;
+                    info.originalEl.classList.add('event-dragging-placeholder');
+
+                    const ghost = info.originalEl.cloneNode(true);
+                    ghost.classList.add('ghost-event');
+                    ghost.classList.remove('cursor-grab', 'active:cursor-grabbing');
+                    ghost.style.width = `${info.width}px`;
+                    ghost.style.height = `${info.height}px`;
+                    ghost.style.left = `${e.clientX - info.offsetX}px`;
+                    ghost.style.top = `${e.clientY - info.offsetY}px`;
+                    document.body.appendChild(ghost);
+                    ghostRef.current = ghost;
+                }
+
+                const ghost = ghostRef.current;
+                if (ghost) {
+                    ghost.style.left = `${e.clientX - info.offsetX}px`;
+                    ghost.style.top = `${e.clientY - info.offsetY}px`;
+                    calculateDragPreview(e.clientX, e.clientY);
+                }
+            };
+
+            const calculateDragPreview = (mouseX, mouseY) => {
+                if (!timelineRef.current || !ghostRef.current) return;
+                
+                const elementsBelow = document.elementsFromPoint(mouseX, mouseY);
+                const dayRow = elementsBelow.find(el => el.getAttribute('data-day'));
+                let newDay = dragInfoRef.current.eventData.day;
+                if (dayRow) { newDay = Number(dayRow.getAttribute('data-day')); }
+
+                const timelineRect = timelineRef.current.getBoundingClientRect();
+                const totalMinutes = TOTAL_HOURS * 60;
+                const ghostLeftX = mouseX - dragInfoRef.current.offsetX;
+                const relativeX = ghostLeftX - timelineRect.left;
+                
+                let newStartMin = Math.round((relativeX / timelineRect.width) * totalMinutes) + (START_HOUR * 60);
+                const duration = dragInfoRef.current.endMin - dragInfoRef.current.startMin;
+                if (newStartMin < START_HOUR * 60) newStartMin = START_HOUR * 60;
+                if (newStartMin + duration > END_HOUR * 60) newStartMin = (END_HOUR * 60) - duration;
+                const newEndMin = newStartMin + duration;
+
+                dragInfoRef.current.newDay = newDay;
+                dragInfoRef.current.newStart = minutesToTime(newStartMin);
+                dragInfoRef.current.newEnd = minutesToTime(newEndMin);
+
+                const timeDiv = ghostRef.current.querySelector('.time-text');
+                if (timeDiv) timeDiv.innerText = `${minutesToTime(newStartMin)}-${minutesToTime(newEndMin)}`;
+            };
+
+            const handleGlobalMouseUp = (e) => {
+                const info = dragInfoRef.current;
+                document.removeEventListener('mousemove', handleGlobalMouseMove);
+                document.removeEventListener('mouseup', handleGlobalMouseUp);
+
+                if (info && info.isDragging && ghostRef.current) {
+                    document.body.removeChild(ghostRef.current);
+                    ghostRef.current = null;
+                    info.originalEl.classList.remove('event-dragging-placeholder');
+
+                    if (info.newDay !== undefined && info.newStart) {
+                        const updatedEvent = { ...info.eventData, day: info.newDay, start: info.newStart, end: info.newEnd };
+                        setEvents(prev => {
+                            const newList = prev.map(ev => ev.id === updatedEvent.id ? updatedEvent : ev);
+                            setTimeout(() => saveData(newList, totalDays), 0);
+                            return newList;
+                        });
+                    }
+                } else if (info && !info.isDragging) {
+                    handleEditClick(info.eventData);
+                }
+                dragInfoRef.current = null;
+            };
+
+            // --- UI 逻辑 ---
+            const handleAddDay = () => saveData(events, totalDays + 1);
+            const handleDeleteDay = (dayToDelete) => {
+                const hasEvents = events.some(e => e.day === dayToDelete);
+                if (hasEvents && !confirm(`第 ${dayToDelete} 天还有行程，确定删除？`)) return;
+                let newEvents = events.filter(e => e.day !== dayToDelete);
+                newEvents = newEvents.map(e => e.day > dayToDelete ? { ...e, day: e.day - 1 } : e);
+                saveData(newEvents, totalDays - 1);
+            };
+
+            const handleExport = () => {
+                const dataStr = JSON.stringify({ events, totalDays }, null, 2);
+                const blob = new Blob([dataStr], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `行程_${ROOM_ID}.json`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+
+            const handleFileChange = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    try {
+                        const imported = JSON.parse(event.target.result);
+                        if (confirm(`确定覆盖当前行程？`)) {
+                            if (Array.isArray(imported)) saveData(imported, 5);
+                            else if (imported.events) saveData(imported.events, imported.totalDays || 5);
+                        }
+                    } catch (err) { alert("文件格式错误"); }
+                };
+                reader.readAsText(file);
+                e.target.value = '';
+            };
+
+            const handleAddClick = (day = 1) => {
+                if (dragInfoRef.current?.isDragging) return;
+                setEditingEvent(null);
+                setFormData({ id: Date.now().toString(), name: '', day, start: '09:00', end: '11:00', type: 'sightseeing', notes: '' });
+                setIsModalOpen(true);
+            };
+            const handleEditClick = (event) => {
+                setEditingEvent(event);
+                setFormData({ ...event });
+                setIsModalOpen(true);
+            };
+            const handleSaveForm = () => {
+                if (!formData.name) return alert("请输入名称");
+                const newEvents = editingEvent ? events.map(e => e.id === editingEvent.id ? formData : e) : [...events, { ...formData, id: Date.now().toString() }];
+                saveData(newEvents, totalDays);
+                setIsModalOpen(false);
+            };
+            const handleDeleteEvent = () => {
+                if (editingEvent && confirm('删除此项？')) {
+                    saveData(events.filter(e => e.id !== editingEvent.id), totalDays);
+                    setIsModalOpen(false);
+                }
+            };
+            const handleReset = () => { if (confirm('重置为默认数据？')) saveData(INITIAL_DATA, 5); };
+            const copyShareLink = () => { navigator.clipboard.writeText(window.location.href); alert("链接已复制！"); };
+
+            const timeToMinutes = (t) => { if(!t) return 0; const [h, m] = t.split(':').map(Number); return h * 60 + m; };
+            const minutesToTime = (m) => {
+                const h = Math.floor(m / 60);
+                const min = Math.floor(m % 60);
+                return `${h.toString().padStart(2, '0')}:${min.toString().padStart(2, '0')}`;
+            };
+
+            const daysArray = Array.from({length: totalDays}, (_, i) => i + 1);
+            const START_HOUR = 5; const END_HOUR = 24; const TOTAL_HOURS = END_HOUR - START_HOUR;
+            const timeMarkers = Array.from({length: END_HOUR - START_HOUR + 1}, (_, i) => START_HOUR + i);
+
+            const EVENT_TYPES = {
+                sightseeing: { label: '景点', gradient: 'from-blue-500 to-indigo-600', shadow: 'shadow-indigo-500/30', icon: MapPin },
+                transport: { label: '交通', gradient: 'from-slate-500 to-zinc-600', shadow: 'shadow-slate-500/30', icon: Bus },
+                food: { label: '餐饮', gradient: 'from-orange-400 to-pink-500', shadow: 'shadow-orange-500/30', icon: Coffee },
+                rest: { label: '休息', gradient: 'from-emerald-400 to-teal-500', shadow: 'shadow-emerald-500/30', icon: Bed },
+            };
+
+            if (!configLoaded) return null;
+
+            return (
+                <div className="min-h-screen font-sans text-slate-800 bg-[#f5f5f7] relative overflow-hidden flex flex-col select-none">
+                    <div className="fixed top-0 left-0 w-full h-full pointer-events-none z-0">
+                         <div className="absolute top-[-20%] left-[-10%] w-[60%] h-[60%] bg-purple-200/40 rounded-full blur-[120px] mix-blend-multiply animate-pulse" />
+                        <div className="absolute top-[10%] right-[-10%] w-[50%] h-[50%] bg-blue-200/40 rounded-full blur-[100px] mix-blend-multiply" />
+                    </div>
+
+                    {/* 侧边栏 */}
+                    <div className={`fixed inset-y-0 left-0 w-72 bg-white/90 backdrop-blur-xl shadow-2xl z-50 transform transition-transform duration-300 ${isMenuOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+                        <div className="p-6 h-full flex flex-col">
+                            <div className="flex justify-between items-center mb-6">
+                                <h2 className="text-xl font-bold flex items-center gap-2"><LayoutGrid size={20}/> 我的行程</h2>
+                                <button onClick={() => setIsMenuOpen(false)} className="p-1 hover:bg-slate-100 rounded-full"><X size={20}/></button>
+                            </div>
+                            <button onClick={createNewTrip} className="w-full py-3 bg-slate-900 text-white rounded-xl mb-6 flex items-center justify-center gap-2 hover:bg-slate-800 transition-colors shadow-lg">
+                                <Plus size={18}/> 创建新行程
+                            </button>
+                            
+                            <div className="flex-1 overflow-y-auto space-y-6 custom-scrollbar pr-2">
+                                {/* 本地历史 */}
+                                <div>
+                                    <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-1"><History size={12}/> 最近访问</h3>
+                                    <div className="space-y-2">
+                                        {history.map(trip => (
+                                            <div key={trip.id} className={`group w-full relative flex items-center p-3 rounded-xl transition-all ${trip.id === ROOM_ID ? 'bg-indigo-50 text-indigo-700 border border-indigo-200' : 'hover:bg-white border border-transparent'}`}>
+                                                <button onClick={() => switchTrip(trip.id)} className="flex-1 text-left truncate font-medium mr-6 focus:outline-none">
+                                                    {trip.id === 'public-plan' ? '公共大厅' : trip.id}
+                                                </button>
+                                                {trip.id === ROOM_ID && <span className="w-2 h-2 bg-indigo-500 rounded-full absolute right-3 pointer-events-none"></span>}
+                                                <button onClick={(e) => deleteHistoryTrip(e, trip.id)} className="absolute right-2 p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-full opacity-0 group-hover:opacity-100 transition-all z-10" title="删除本地记录">
+                                                    <Trash2 size={14}/>
+                                                </button>
+                                            </div>
+                                        ))}
+                                        {history.length === 0 && <p className="text-sm text-slate-400 italic px-2">暂无历史记录</p>}
+                                    </div>
+                                </div>
+
+                                {/* 云端列表 */}
+                                <div>
+                                    <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-1"><Cloud size={12}/> 云端所有行程</h3>
+                                    {status === 'connected' ? (
+                                        <div className="space-y-2">
+                                            {cloudRooms.map(trip => (
+                                                <div key={trip.id} className={`group w-full relative flex items-center p-3 rounded-xl transition-all ${trip.id === ROOM_ID ? 'bg-indigo-50 text-indigo-700 border border-indigo-200' : 'hover:bg-white border border-transparent'}`}>
+                                                    <button onClick={() => switchTrip(trip.id)} className="flex-1 text-left truncate font-medium mr-6 focus:outline-none">
+                                                        {trip.id === 'public-plan' ? '公共大厅' : trip.id}
+                                                    </button>
+                                                    {trip.id === ROOM_ID && <span className="w-2 h-2 bg-indigo-500 rounded-full absolute right-3 pointer-events-none"></span>}
+                                                    {/* 使用 EyeOff 图标表示“隐藏/软删除”更贴切 */}
+                                                    <button onClick={(e) => deleteCloudTrip(e, trip.id)} className="absolute right-2 p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-full opacity-0 group-hover:opacity-100 transition-all z-10" title="移除云端行程">
+                                                        <EyeOff size={14}/>
+                                                    </button>
+                                                </div>
+                                            ))}
+                                            {cloudRooms.length === 0 && <p className="text-sm text-slate-400 italic px-2">云端暂无数据</p>}
+                                        </div>
+                                    ) : (
+                                        <p className="text-sm text-slate-400 italic px-2 flex items-center gap-1"><WifiOff size={12}/> 连接后查看云端列表</p>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {isMenuOpen && <div className="fixed inset-0 bg-black/20 z-40 backdrop-blur-sm" onClick={() => setIsMenuOpen(false)}></div>}
+
+                    {/* 顶部导航 */}
+                    <header className="px-4 py-3 md:px-8 md:py-4 flex flex-col md:flex-row justify-between items-center z-20 sticky top-0 gap-3 bg-white/70 backdrop-blur-xl border-b border-white/40 shadow-sm flex-shrink-0">
+                        <div className="flex items-center gap-4 w-full md:w-auto">
+                            <button onClick={() => setIsMenuOpen(true)} className="p-2 -ml-2 hover:bg-white/50 rounded-lg transition-colors text-slate-600"><Menu size={24} /></button>
+                            <div>
+                                <h1 className="text-lg md:text-xl font-bold text-slate-900 tracking-tight flex items-center gap-2">{ROOM_ID === 'public-plan' ? '公共大厅' : ROOM_ID}</h1>
+                                <div className="flex items-center gap-2">
+                                    {status === 'connected' ? <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-100 flex items-center gap-1"><Wifi size={10}/> 在线同步</span> : <span className="text-[10px] font-bold text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-100 flex items-center gap-1"><WifiOff size={10}/> 离线模式</span>}
+                                </div>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <input type="file" ref={fileInputRef} onChange={handleFileChange} accept=".json" className="hidden" />
+                            <div className="flex bg-slate-100/50 rounded-full p-1 border border-white/50">
+                                <button onClick={handleReset} title="重置" className="p-2 text-slate-500 hover:text-red-500 hover:bg-white rounded-full transition-all"><RotateCcw size={16} /></button>
+                                <button onClick={() => fileInputRef.current?.click()} title="导入JSON" className="p-2 text-slate-500 hover:text-indigo-600 hover:bg-white rounded-full transition-all"><Upload size={16} /></button>
+                                <button onClick={handleExport} title="导出JSON" className="p-2 text-slate-500 hover:text-indigo-600 hover:bg-white rounded-full transition-all"><Download size={16} /></button>
+                            </div>
+                            <div className="w-px h-6 bg-slate-300/50 mx-1"></div>
+                            <button onClick={copyShareLink} className="p-2 text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-full border border-indigo-200 transition-all"><Share2 size={18} /></button>
+                        </div>
+                    </header>
+
+                    {/* 主画布 */}
+                    <main className="flex-1 overflow-x-auto p-4 md:p-8 flex flex-col">
+                        <div className="bg-white/40 backdrop-blur-2xl rounded-[2rem] shadow-xl border border-white/60 min-w-[1000px] relative overflow-hidden flex flex-col flex-1">
+                            {/* 时间轴头 */}
+                            <div className="flex bg-white/40 border-b border-white/30 h-12 sticky top-0 z-10 flex-shrink-0">
+                                <div className="w-24 border-r border-white/30 flex items-center justify-center text-xs font-bold text-slate-400 bg-white/10">日期</div>
+                                <div className="flex-1 relative" ref={timelineRef}>
+                                    {timeMarkers.map(h => (
+                                        <div key={h} className="absolute top-0 bottom-0 border-l border-slate-300/20 text-[10px] text-slate-400 pl-1 pt-3" style={{left: `${((h-START_HOUR)/TOTAL_HOURS)*100}%`}}>{h}:00</div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* 内容区 */}
+                            <div className="divide-y divide-slate-200/30 flex-1 overflow-y-auto custom-scrollbar">
+                                {daysArray.map(day => (
+                                    <div key={day} className="flex h-36 hover:bg-white/20 transition-colors relative group day-row" data-day={day}>
+                                        <div className="w-24 border-r border-white/30 flex flex-col items-center justify-center p-2 z-10 bg-white/5 backdrop-blur-[1px] relative">
+                                            {totalDays > 1 && (
+                                                <button onClick={(e) => { e.stopPropagation(); handleDeleteDay(day); }} className="absolute top-2 left-2 p-1 text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity" title="删除这一天"><MinusCircle size={14} /></button>
+                                            )}
+                                            <span className="text-2xl font-bold text-slate-800/60 font-mono mt-1">{String(day).padStart(2,'0')}</span>
+                                            <button onClick={() => handleAddClick(day)} className="mt-2 w-6 h-6 flex items-center justify-center rounded-full bg-indigo-50 text-indigo-600 opacity-0 group-hover:opacity-100 hover:scale-110 transition-all shadow-sm"><Plus size={14}/></button>
+                                        </div>
+                                        <div className="flex-1 relative">
+                                            {timeMarkers.map(h => <div key={h} className="absolute inset-y-0 border-l border-slate-200/20 pointer-events-none" style={{left: `${((h-START_HOUR)/TOTAL_HOURS)*100}%`}}/>)}
+                                            {events.filter(e => e.day === day).map(event => {
+                                                const style = {
+                                                    left: `${Math.max(0, ((timeToMinutes(event.start) - START_HOUR*60) / (TOTAL_HOURS*60)) * 100)}%`,
+                                                    width: `${Math.min(100, ((timeToMinutes(event.end) - timeToMinutes(event.start)) / (TOTAL_HOURS*60)) * 100)}%`
+                                                };
+                                                const typeCfg = EVENT_TYPES[event.type] || EVENT_TYPES.sightseeing;
+                                                
+                                                return (
+                                                    <div 
+                                                        key={event.id} 
+                                                        onMouseDown={(e) => handleMouseDown(e, event)}
+                                                        className={`absolute top-2 bottom-2 rounded-xl cursor-grab active:cursor-grabbing bg-gradient-to-br ${typeCfg.gradient} ${typeCfg.shadow} text-white border border-white/20 shadow-md hover:shadow-lg hover:z-20 transition-all px-2 flex flex-col justify-center overflow-hidden ring-1 ring-black/5`} 
+                                                        style={style}
+                                                    >
+                                                        <div className="flex items-center gap-1 font-bold text-xs truncate pointer-events-none">
+                                                            <typeCfg.icon size={12} className="opacity-80 flex-shrink-0"/>
+                                                            <span className="truncate">{event.name}</span>
+                                                        </div>
+                                                        <div className="time-text text-[10px] opacity-90 truncate mt-0.5 pointer-events-none">{event.start}-{event.end}</div>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+                                ))}
+                                
+                                <div className="p-4 flex justify-center bg-white/10 hover:bg-white/20 transition-colors border-t border-white/20 cursor-pointer" onClick={handleAddDay}>
+                                    <button className="flex items-center gap-2 text-slate-500 font-medium hover:text-indigo-600 transition-colors">
+                                        <CirclePlus size={20} />
+                                        <span>添加一天 (第 {totalDays + 1} 天)</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </main>
+
+                    {/* 编辑弹窗 */}
+                    {isModalOpen && (
+                        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-slate-900/20 backdrop-blur-sm" onClick={() => setIsModalOpen(false)}>
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden animate-in fade-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+                                <div className="px-5 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
+                                    <h3 className="font-bold text-slate-800">{editingEvent ? '编辑' : '新建'}</h3>
+                                    <button onClick={() => setIsModalOpen(false)}><X size={18} className="text-slate-400 hover:text-slate-600"/></button>
+                                </div>
+                                <div className="p-5 space-y-4">
+                                    <input value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500/50 outline-none text-sm font-medium" placeholder="行程名称" autoFocus />
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <select value={formData.type} onChange={e => setFormData({...formData, type: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg outline-none text-sm">{Object.entries(EVENT_TYPES).map(([k,v]) => <option key={k} value={k}>{v.label}</option>)}</select>
+                                        <div className="relative"><select value={formData.day} onChange={e => setFormData({...formData, day: Number(e.target.value)})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg outline-none text-sm appearance-none">{daysArray.map(d => <option key={d} value={d}>第{d}天</option>)}</select><Calendar size={14} className="absolute right-3 top-2.5 text-slate-400 pointer-events-none"/></div>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <input type="time" value={formData.start} onChange={e => setFormData({...formData, start: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg outline-none text-sm font-mono"/>
+                                        <input type="time" value={formData.end} onChange={e => setFormData({...formData, end: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg outline-none text-sm font-mono"/>
+                                    </div>
+                                    <textarea value={formData.notes} onChange={e => setFormData({...formData, notes: e.target.value})} className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg outline-none text-sm h-20 resize-none" placeholder="备注..."/>
+                                </div>
+                                <div className="px-5 py-4 border-t border-slate-100 flex justify-between bg-slate-50/50">
+                                    {editingEvent ? <button onClick={handleDeleteEvent} className="text-red-500 text-sm hover:bg-red-50 px-2 py-1 rounded"><Trash2 size={16}/></button> : <div/>}
+                                    <div className="flex gap-2">
+                                        <button onClick={() => setIsModalOpen(false)} className="px-4 py-1.5 text-slate-500 text-sm font-medium hover:bg-slate-100 rounded-lg">取消</button>
+                                        <button onClick={handleSaveForm} className="px-5 py-1.5 bg-slate-900 text-white text-sm font-medium rounded-lg hover:bg-slate-800 shadow-lg shadow-slate-900/20">保存</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(<TravelPlanner />);
+    </script>
+</body>
+</html>
